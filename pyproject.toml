@@ -1,0 +1,15 @@
+
+[build-system]
+requires = ["setuptools", "wheel"]
+
+[project]
+name = "jwks-server-edu"
+version = "0.1.0"
+description = "Educational JWKS server with JWT issuance and key expiry"
+authors = [{name="Your Name"}]
+requires-python = ">=3.10"
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "I"]
+ignore = []
