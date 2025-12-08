@@ -16,14 +16,83 @@ Schema:
 
 import base64
 import hashlib
+import os
 import sqlite3
+import threading
 import time
+import uuid
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import jwt
-from cryptography.hazmat.primitives import serialization
+from argon2 import PasswordHasher
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.padding import PKCS7
+
+# ----- AES Encryption Helpers -----
+
+def _get_aes_key() -> bytes:
+    """Get the AES encryption key from environment variable NOT_MY_KEY.
+
+    Returns a 32-byte key derived from the environment variable.
+    Falls back to a default key if NOT_MY_KEY is not set (for development only).
+    """
+    key_str = os.environ.get("NOT_MY_KEY", "default-key-for-development-only-never-use-in-production")
+    # Derive a 32-byte key using SHA-256
+    return hashlib.sha256(key_str.encode()).digest()
+
+
+def _encrypt_aes(plaintext: bytes) -> bytes:
+    """Encrypt plaintext using AES-256-CBC with PKCS7 padding.
+
+    Args:
+        plaintext: The data to encrypt (typically a PEM private key).
+
+    Returns:
+        Encrypted data with IV prepended (IV is first 16 bytes).
+    """
+    key = _get_aes_key()
+    iv = os.urandom(16)  # Random 16-byte IV for CBC mode
+
+    # Apply PKCS7 padding
+    padder = PKCS7(128).padder()
+    padded_data = padder.update(plaintext) + padder.finalize()
+
+    # Encrypt with AES-256-CBC
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
+    encryptor = cipher.encryptor()
+    ciphertext = encryptor.update(padded_data) + encryptor.finalize()
+
+    # Prepend IV to ciphertext for storage
+    return iv + ciphertext
+
+
+def _decrypt_aes(ciphertext_with_iv: bytes) -> bytes:
+    """Decrypt AES-256-CBC encrypted data with PKCS7 padding.
+
+    Args:
+        ciphertext_with_iv: Encrypted data with IV prepended (IV is first 16 bytes).
+
+    Returns:
+        Decrypted plaintext.
+    """
+    key = _get_aes_key()
+    iv = ciphertext_with_iv[:16]
+    ciphertext = ciphertext_with_iv[16:]
+
+    # Decrypt with AES-256-CBC
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
+    decryptor = cipher.decryptor()
+    padded_data = decryptor.update(ciphertext) + decryptor.finalize()
+
+    # Remove PKCS7 padding
+    unpadder = PKCS7(128).unpadder()
+    plaintext = unpadder.update(padded_data) + unpadder.finalize()
+
+    return plaintext
+
 
 # ----- Helpers -----
 
@@ -80,7 +149,10 @@ class KeyStore:
     def __init__(self) -> None:
         # Open/create the SQLite DB in the current working directory
         self.db_path = "totally_not_my_privateKeys.db"
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self._local = threading.local()
+        self._lock = threading.Lock()
+        # Create initial connection to set up database
+        conn = self._get_conn()
         self._init_db()
         self._ensure_keys()
 
@@ -89,10 +161,24 @@ class KeyStore:
         self.active = self._select_one(exp_comparison=">", now_value=now)
         self.expired = self._select_one(exp_comparison="<=", now_value=now)
 
+    def _get_conn(self) -> sqlite3.Connection:
+        """Get a thread-local database connection."""
+        if not hasattr(self._local, 'conn') or self._local.conn is None:
+            self._local.conn = sqlite3.connect(
+                self.db_path,
+                check_same_thread=False,
+                timeout=30.0,
+                isolation_level=None  # Autocommit mode
+            )
+            # Use DELETE mode instead of WAL for better compatibility with external readers
+            self._local.conn.execute("PRAGMA journal_mode=DELETE")
+            self._local.conn.execute("PRAGMA synchronous=FULL")
+        return self._local.conn
+
     def _init_db(self) -> None:
         """Create the required table schema if it does not exist."""
         # Use a static DDL string; no user inputs involved here
-        self.conn.execute(
+        self._get_conn().execute(
             """
             CREATE TABLE IF NOT EXISTS keys(
                 kid INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -101,27 +187,52 @@ class KeyStore:
             )
             """
         )
-        self.conn.commit()
+        # Create users table for user registration
+        self._get_conn().execute(
+            """
+            CREATE TABLE IF NOT EXISTS users(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                email TEXT UNIQUE,
+                date_registered TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_login TIMESTAMP
+            )
+            """
+        )
+        # Create auth_logs table for logging authentication requests
+        self._get_conn().execute(
+            """
+            CREATE TABLE IF NOT EXISTS auth_logs(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_ip TEXT NOT NULL,
+                request_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                user_id INTEGER,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+            """
+        )
 
     def _ensure_keys(self) -> None:
         """Ensure the DB has at least one expired and one valid key persisted."""
-        cur = self.conn.execute("SELECT COUNT(*) FROM keys")
+        cur = self._get_conn().execute("SELECT COUNT(*) FROM keys")
         (count,) = cur.fetchone()
         if count == 0:
             now = int(time.time())
             # Generate active (valid for >=1 hour) and expired (expired 1 hour ago)
             active_rec = self._generate_keypair(not_after=now + 3600)
             expired_rec = self._generate_keypair(not_after=now - 3600)
-            # Persist private key PEM and expiry using parameterized queries
-            self.conn.execute(
+            # Encrypt and persist private key PEM and expiry using parameterized queries
+            encrypted_active = _encrypt_aes(active_rec.private_pem)
+            encrypted_expired = _encrypt_aes(expired_rec.private_pem)
+            self._get_conn().execute(
                 "INSERT INTO keys(key, exp) VALUES(?, ?)",
-                (active_rec.private_pem, active_rec.not_after),
+                (encrypted_active, active_rec.not_after),
             )
-            self.conn.execute(
+            self._get_conn().execute(
                 "INSERT INTO keys(key, exp) VALUES(?, ?)",
-                (expired_rec.private_pem, expired_rec.not_after),
+                (encrypted_expired, expired_rec.not_after),
             )
-            self.conn.commit()
 
     def _select_one(self, *, exp_comparison: str, now_value: int) -> RSAKeyRecord:
         """Select one key by expiry policy.
@@ -139,7 +250,7 @@ class KeyStore:
             "SELECT key, exp FROM keys WHERE exp "
             f"{exp_comparison} ? ORDER BY exp {order} LIMIT 1"
         )
-        cur = self.conn.execute(query, (now_value,))
+        cur = self._get_conn().execute(query, (now_value,))
         row = cur.fetchone()
         if not row:
             # Fallback: regenerate a key with a suitable expiry
@@ -147,7 +258,9 @@ class KeyStore:
                 not_after=now_value + (3600 if exp_comparison == ">" else -3600)
             )
             return regen
-        private_pem, exp = row[0], row[1]
+        encrypted_key, exp = row[0], row[1]
+        # Decrypt the private key before using it
+        private_pem = _decrypt_aes(encrypted_key)
         return self._record_from_private_pem(private_pem=private_pem, not_after=exp)
 
     def _record_from_private_pem(self, *, private_pem: bytes, not_after: int) -> RSAKeyRecord:
@@ -173,8 +286,10 @@ class KeyStore:
         """Return public JWKs for all valid (non-expired) keys from the database."""
         now = int(time.time())
         keys: List[Dict[str, str]] = []
-        cur = self.conn.execute("SELECT key, exp FROM keys WHERE exp > ?", (now,))
-        for private_pem, exp in cur.fetchall():
+        cur = self._get_conn().execute("SELECT key, exp FROM keys WHERE exp > ?", (now,))
+        for encrypted_key, exp in cur.fetchall():
+            # Decrypt the private key before using it
+            private_pem = _decrypt_aes(encrypted_key)
             rec = self._record_from_private_pem(private_pem=private_pem, not_after=exp)
             keys.append(rec.public_jwk())
         return keys
@@ -224,3 +339,60 @@ class KeyStore:
             kid=kid,
             not_after=not_after,
         )
+
+    # ---- User Management ----
+
+    def register_user(self, *, username: str, email: Optional[str]) -> str:
+        """Register a new user with a generated UUIDv4 password.
+
+        Args:
+            username: The username for the new user.
+            email: The optional email address for the new user.
+
+        Returns:
+            The generated UUIDv4 password (plaintext) to be returned to the user.
+
+        Raises:
+            sqlite3.IntegrityError: If username or email already exists.
+        """
+        # Generate a secure UUIDv4 password
+        password = str(uuid.uuid4())
+
+        # Hash the password using Argon2
+        ph = PasswordHasher()
+        password_hash = ph.hash(password)
+
+        # Insert the user into the database using parameterized query
+        self._get_conn().execute(
+            "INSERT INTO users(username, password_hash, email) VALUES(?, ?, ?)",
+            (username, password_hash, email),
+        )
+
+        return password
+
+    def get_user_id_by_username(self, *, username: str) -> Optional[int]:
+        """Get user ID by username.
+
+        Args:
+            username: The username to look up.
+
+        Returns:
+            The user ID if found, None otherwise.
+        """
+        cur = self._get_conn().execute("SELECT id FROM users WHERE username = ?", (username,))
+        row = cur.fetchone()
+        return row[0] if row else None
+
+    def log_auth_request(self, *, request_ip: str, user_id: Optional[int] = None) -> None:
+        """Log an authentication request to the auth_logs table.
+
+        Args:
+            request_ip: The IP address of the request.
+            user_id: The optional user ID if known.
+        """
+        with self._lock:
+            conn = self._get_conn()
+            conn.execute(
+                "INSERT INTO auth_logs(request_ip, user_id) VALUES(?, ?)",
+                (request_ip, user_id),
+            )
